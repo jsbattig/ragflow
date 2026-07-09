@@ -468,11 +468,32 @@ class DatabaseMigrator(Enum):
     POSTGRES = PostgresqlMigrator
 
 
+def _apply_charset_default(database_config, database_type):
+    """Default the MySQL/OceanBase connection charset to utf8mb4.
+
+    peewee's ``MySQLDatabase`` (and therefore our pooled/retrying subclasses)
+    silently defaults the connection charset to ``utf8`` -- MySQL's alias
+    for the legacy 3-byte utf8mb3 -- whenever the caller does not pass one.
+    Every table/column in the RAGFlow schema is ``utf8mb4_0900_ai_ci``, so a
+    utf8mb3 connection literal mixed with a utf8mb4 column trips MySQL error
+    1267 ("Illegal mix of collations") on any query that CONCATs a column
+    with a string literal (e.g. FileService's file-existence/dedup lookups
+    during connector sync), which silently drops the affected documents.
+    ``setdefault`` keeps an operator-set ``charset`` in service_conf.yaml in
+    control, and only MySQL-family backends are touched -- postgres has no
+    such mismatch and does not accept this kwarg.
+    """
+    if database_type.upper() in ("MYSQL", "OCEANBASE"):
+        database_config.setdefault("charset", "utf8mb4")
+    return database_config
+
+
 @singleton
 class BaseDataBase:
     def __init__(self):
         database_config = settings.DATABASE.copy()
         db_name = database_config.pop("name")
+        database_config = _apply_charset_default(database_config, settings.DATABASE_TYPE)
 
         pool_config = {
             "max_retries": 5,
