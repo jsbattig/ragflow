@@ -43,15 +43,24 @@ def chunk(
         "parser_config",
         {"chunk_token_num": 512, "delimiter": "\n!?。；！？", "layout_recognize": "DeepDOC"},
     )
+    title_text = re.sub(r"\.[a-zA-Z]+$", "", filename)
     doc = {
         "docnm_kwd": filename,
-        "title_tks": rag_tokenizer.tokenize(re.sub(r"\.[a-zA-Z]+$", "", filename)),
+        "title_tks": rag_tokenizer.tokenize(title_text),
     }
     doc["title_sm_tks"] = rag_tokenizer.fine_grained_tokenize(doc["title_tks"])
     main_res = []
     attachment_res = []
 
-    if binary:
+    # `filename` is the caller-supplied name (e.g. an IMAP email subject) --
+    # never assume it is a real filesystem path when in-memory content was
+    # provided. Bytes objects are falsy when empty (`bool(b"") is False`), so
+    # `if binary:` would treat an empty-body email's `binary=b""` as "no
+    # binary given" and fall through to `open(filename, "rb")`, crashing with
+    # `[Errno 2] No such file or directory` on a subject that just happens to
+    # look like one. `binary is not None` is the correct "was content
+    # supplied" check.
+    if binary is not None:
         with io.BytesIO(binary) as buffer:
             msg = BytesParser(policy=policy.default).parse(buffer)
     else:
@@ -104,6 +113,22 @@ def chunk(
 
     main_res.extend(tokenize_chunks(chunks, doc, eng, None, language=lang))
     logging.debug("naive_merge({}): {}".format(filename, timer() - st))
+
+    if not main_res:
+        # The body was empty or entirely undecodable (e.g. an empty-body
+        # email). Don't silently drop the document -- index whatever usable
+        # content the subject itself carries instead. naive_merge()/
+        # tokenize_chunks() already skip blank content, so an unusable
+        # subject (nothing left after stripping the extension) falls straight
+        # through to an empty result here too, same as a normal empty
+        # document -- not a crash.
+        subject_chunks = naive_merge(
+            title_text,
+            int(parser_config.get("chunk_token_num", 128)),
+            parser_config.get("delimiter", "\n!?。；！？"),
+        )
+        main_res.extend(tokenize_chunks(subject_chunks, doc, eng, None, language=lang))
+
     # get the attachment info
     for part in msg.iter_attachments():
         content_disposition = part.get("Content-Disposition")
