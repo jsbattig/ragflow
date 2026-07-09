@@ -6,12 +6,17 @@ import imaplib
 import logging
 import os
 import re
+import socket
+import ssl
+import time
 from datetime import datetime, timedelta
 from datetime import timezone
 from email.message import Message
 from email.utils import collapse_rfc2231_value, getaddresses
 from enum import Enum
 from typing import Any
+from typing import Callable
+from typing import TypeVar
 from typing import cast
 
 import bs4
@@ -40,6 +45,87 @@ _PAGE_SIZE = 100
 _USERNAME_KEY = "imap_username"
 _PASSWORD_KEY = "imap_password"
 
+# Gmail (and other IMAP servers) will kill a long-running / high-volume IMAP
+# session out from under the client mid-command - most commonly surfaced as
+# `imaplib.IMAP4.abort: command: UID => System Error`. `imaplib.IMAP4_SSL`
+# sessions are ephemeral (see `ImapConnector._get_mail_client`'s docstring):
+# once the socket/session is dead, the only way back is a brand-new login.
+# These are the exception types that indicate "the session/connection died",
+# as opposed to "the request itself was rejected" - and are therefore safe
+# to retry after reconnecting. `ssl.SSLError`/`socket.error` are already
+# subclasses of `OSError`; they're listed explicitly for clarity.
+_TRANSIENT_IMAP_ERRORS: tuple[type[BaseException], ...] = (
+    imaplib.IMAP4.abort,
+    imaplib.IMAP4.error,
+    OSError,
+    ssl.SSLError,
+    socket.error,
+)
+_MAX_TRANSIENT_RETRIES = 5
+_INITIAL_RETRY_BACKOFF_SECONDS = 1.0
+_MAX_RETRY_BACKOFF_SECONDS = 30.0
+
+_T = TypeVar("_T")
+
+
+class _ImapRetryExhausted(Exception):
+    """All transient-error retries for one IMAP operation were exhausted.
+
+    Carries the last (possibly reconnected) `mail_client` so the caller can
+    keep using a live connection for subsequent operations even though this
+    particular operation ultimately failed.
+    """
+
+    def __init__(self, last_exc: BaseException, mail_client: imaplib.IMAP4_SSL) -> None:
+        super().__init__(str(last_exc))
+        self.last_exc = last_exc
+        self.mail_client = mail_client
+
+
+def _call_with_imap_retry(
+    mail_client: imaplib.IMAP4_SSL,
+    reconnect: Callable[[], imaplib.IMAP4_SSL],
+    description: str,
+    op: Callable[[imaplib.IMAP4_SSL], _T],
+) -> tuple[_T, imaplib.IMAP4_SSL]:
+    """
+    Invoke `op(mail_client)`, transparently reconnecting (via `reconnect`) and
+    retrying on a transient IMAP session failure - the prototypical case
+    being Gmail's mid-session `imaplib.IMAP4.abort: ... System Error` on
+    long-running / high-volume pulls.
+
+    Returns `(result, mail_client)`; `mail_client` may be a *new* object if a
+    reconnect happened, so callers must use the returned client for all
+    subsequent calls against this mailbox.
+
+    Raises `_ImapRetryExhausted` if all `_MAX_TRANSIENT_RETRIES` attempts
+    fail - callers decide whether that means skipping one message or giving
+    up on a whole mailbox, and can recover the latest live client via the
+    raised exception's `.mail_client` attribute.
+    """
+    backoff = _INITIAL_RETRY_BACKOFF_SECONDS
+    last_exc: BaseException | None = None
+
+    for attempt in range(1, _MAX_TRANSIENT_RETRIES + 1):
+        try:
+            return op(mail_client), mail_client
+        except _TRANSIENT_IMAP_ERRORS as exc:
+            last_exc = exc
+            logging.warning(f"IMAP session error while {description} (attempt {attempt}/{_MAX_TRANSIENT_RETRIES}): {exc!r}")
+            if attempt == _MAX_TRANSIENT_RETRIES:
+                break
+            time.sleep(backoff)
+            backoff = min(backoff * 2, _MAX_RETRY_BACKOFF_SECONDS)
+            try:
+                mail_client = reconnect()
+                logging.info(f"Reconnected to IMAP server; resuming {description}")
+            except _TRANSIENT_IMAP_ERRORS as reconnect_exc:
+                last_exc = reconnect_exc
+                logging.warning(f"Reconnect attempt {attempt} failed while {description}: {reconnect_exc!r}")
+
+    assert last_exc is not None, "retry loop must set last_exc before exhausting attempts"
+    raise _ImapRetryExhausted(last_exc=last_exc, mail_client=mail_client)
+
 
 class Header(str, Enum):
     SUBJECT_HEADER = "subject"
@@ -58,7 +144,7 @@ class EmailHeaders(BaseModel):
 
     id: str
     subject: str
-    sender: str
+    sender: str | None = None
     recipients: str | None
     cc: str | None
     date: datetime
@@ -172,12 +258,45 @@ class ImapConnector(
         self._port = port
         self._mailboxes = mailboxes
         self._credentials: dict[str, Any] | None = None
+        # Count of messages permanently skipped after exhausting transient-error
+        # retries (see `_call_with_imap_retry`). A message is only ever counted
+        # here, never silently dropped without a log line.
+        self._failed_fetch_count = 0
+        # Per-mailbox durable resume state: `{mailbox: {"uidvalidity": int, "last_uid": int}}`.
+        # Restored via `load_uid_checkpoints` and read back via `uid_checkpoints` so the
+        # caller (`rag/svr/sync_data_source.py`) can persist it into the connector's
+        # `config`, the same way it already persists `imap_initial_sync_start`. This lets
+        # a from-beginning pull killed at the task level (timeout, container restart,
+        # Gmail's daily bandwidth cap) resume without re-scanning/re-fetching everything.
+        self._uid_checkpoints: dict[str, dict[str, int]] = {}
 
     @property
     def credentials(self) -> dict[str, Any]:
         if not self._credentials:
             raise RuntimeError("Credentials have not been initialized; call `set_credentials_provider` first")
         return self._credentials
+
+    @property
+    def failed_fetch_count(self) -> int:
+        return self._failed_fetch_count
+
+    @property
+    def uid_checkpoints(self) -> dict[str, dict[str, int]]:
+        """Current per-mailbox `{uidvalidity, last_uid}` high-water marks - JSON-serializable,
+        suitable for persisting into the connector's `config` (see `load_uid_checkpoints`)."""
+        return copy.deepcopy(self._uid_checkpoints)
+
+    def load_uid_checkpoints(self, checkpoints: dict[str, dict[str, int]] | None) -> None:
+        """Restores previously-persisted per-mailbox UID high-water marks (see `uid_checkpoints`)
+        so a resumed pull can skip UIDs already processed in a prior task invocation instead of
+        re-scanning the whole mailbox from UID 0."""
+        restored: dict[str, dict[str, int]] = {}
+        for mailbox, entry in (checkpoints or {}).items():
+            try:
+                restored[mailbox] = {"uidvalidity": int(entry["uidvalidity"]), "last_uid": int(entry["last_uid"])}
+            except (KeyError, TypeError, ValueError):
+                logging.warning(f"Ignoring malformed persisted UID checkpoint for mailbox {mailbox!r}: {entry!r}")
+        self._uid_checkpoints = restored
 
     def _get_mail_client(self) -> imaplib.IMAP4_SSL:
         """
@@ -217,6 +336,70 @@ class ImapConnector(
 
         return mail_client
 
+    def _make_reconnect(self, mailbox: str) -> Callable[[], imaplib.IMAP4_SSL]:
+        """
+        Builds a zero-arg callable that produces a brand-new, already-`mailbox`-selected
+        `IMAP4_SSL` session - for use as the `reconnect` callback passed to
+        `_call_with_imap_retry` when a transient IMAP session failure (e.g. a Gmail
+        mid-session `abort`) needs a fresh connection to resume on.
+        """
+
+        def reconnect() -> imaplib.IMAP4_SSL:
+            mail_client = self._get_mail_client()
+            if not _select_mailbox(mail_client=mail_client, mailbox=mailbox):
+                raise RuntimeError(f"Failed to re-select mailbox {mailbox!r} after reconnecting")
+            return mail_client
+
+        return reconnect
+
+    def _resolve_resume_uid(self, mailbox: str, uidvalidity: int | None) -> int:
+        """
+        Determines the UID to resume `mailbox` from (SEARCH results with UID <= this
+        value are skipped as already-processed), reconciling the freshly-fetched
+        `uidvalidity` against any saved checkpoint for this mailbox:
+
+        - No saved checkpoint: start from 0; seed a checkpoint if `uidvalidity` is known.
+        - Saved checkpoint, `uidvalidity` unknown (e.g. STATUS failed): trust the saved
+          checkpoint rather than lose resume progress over a transient hiccup.
+        - Saved checkpoint, `uidvalidity` unchanged: resume from the saved `last_uid`.
+        - Saved checkpoint, `uidvalidity` changed: the server may have reused UID
+          numbers (RFC 3501) - the old high-water mark is meaningless. Restart from 0.
+        """
+        existing = self._uid_checkpoints.get(mailbox)
+
+        if existing is None:
+            if uidvalidity is not None:
+                self._uid_checkpoints[mailbox] = {"uidvalidity": uidvalidity, "last_uid": 0}
+            return 0
+
+        if uidvalidity is None:
+            return existing["last_uid"]
+
+        if existing["uidvalidity"] != uidvalidity:
+            logging.warning(f"UIDVALIDITY changed for mailbox {mailbox!r} ({existing['uidvalidity']} -> {uidvalidity}); restarting mailbox from UID 0")
+            self._uid_checkpoints[mailbox] = {"uidvalidity": uidvalidity, "last_uid": 0}
+            return 0
+
+        return existing["last_uid"]
+
+    def _advance_uid_checkpoint(self, mailbox: str, email_id: str) -> None:
+        """
+        Records that `email_id` has been dealt with (fetched successfully, or
+        permanently given up on after exhausting retries) for `mailbox`, advancing
+        the saved high-water mark if `email_id` is the largest seen so far.
+
+        No-op if `mailbox` has no checkpoint entry yet (UIDVALIDITY was never
+        successfully established for it) - there's nothing to safely anchor a
+        resume cursor to in that case.
+        """
+        existing = self._uid_checkpoints.get(mailbox)
+        if existing is None:
+            return
+
+        uid_int = _safe_int(email_id)
+        if uid_int > existing["last_uid"]:
+            existing["last_uid"] = uid_int
+
     def _load_from_checkpoint(
         self,
         start: SecondsSinceUnixEpoch,
@@ -248,12 +431,31 @@ class ImapConnector(
                 return checkpoint
 
             mailbox = checkpoint.todo_mailboxes.pop()
-            email_ids = _fetch_email_ids_in_mailbox(
-                mail_client=mail_client,
-                mailbox=mailbox,
-                start=start,
-                end=end,
-            )
+            try:
+                uidvalidity, mail_client = _call_with_imap_retry(
+                    mail_client=mail_client,
+                    reconnect=self._make_reconnect(mailbox=mailbox),
+                    description=f"fetching UIDVALIDITY for mailbox {mailbox!r}",
+                    op=lambda client: _fetch_uidvalidity(mail_client=client, mailbox=mailbox),
+                )
+            except _ImapRetryExhausted as exc:
+                mail_client = exc.mail_client
+                logging.warning(f"Failed to fetch UIDVALIDITY for mailbox {mailbox!r}: {exc.last_exc!r}; resume filtering may be limited to a previously-saved checkpoint")
+                uidvalidity = None
+
+            min_uid_exclusive = self._resolve_resume_uid(mailbox=mailbox, uidvalidity=uidvalidity)
+
+            try:
+                email_ids, mail_client = _call_with_imap_retry(
+                    mail_client=mail_client,
+                    reconnect=self._make_reconnect(mailbox=mailbox),
+                    description=f"searching mailbox {mailbox!r}",
+                    op=lambda client: _fetch_email_ids_in_mailbox(mail_client=client, mailbox=mailbox, start=start, end=end, min_uid_exclusive=min_uid_exclusive),
+                )
+            except _ImapRetryExhausted as exc:
+                mail_client = exc.mail_client
+                logging.warning(f"Giving up on mailbox {mailbox!r} after repeated IMAP session errors: {exc.last_exc!r}; skipping mailbox")
+                email_ids = []
             checkpoint.current_mailbox = CurrentMailbox(
                 mailbox=mailbox,
                 todo_email_ids=email_ids,
@@ -264,7 +466,28 @@ class ImapConnector(
         checkpoint.current_mailbox.todo_email_ids = checkpoint.current_mailbox.todo_email_ids[_PAGE_SIZE:]
 
         for email_id in current_todos:
-            email_msg = _fetch_email(mail_client=mail_client, email_id=email_id)
+            try:
+                email_msg, mail_client = _call_with_imap_retry(
+                    mail_client=mail_client,
+                    reconnect=self._make_reconnect(mailbox=checkpoint.current_mailbox.mailbox),
+                    description=f"fetching message uid={email_id!r}",
+                    op=lambda client, email_id=email_id: _fetch_email(mail_client=client, email_id=email_id),
+                )
+            except _ImapRetryExhausted as exc:
+                self._failed_fetch_count += 1
+                logging.error(
+                    f"Permanently failed to fetch message uid={email_id!r} after {_MAX_TRANSIENT_RETRIES} attempts: "
+                    f"{exc.last_exc!r}; skipping this message ({self._failed_fetch_count} total failures so far)"
+                )
+                mail_client = exc.mail_client
+                self._advance_uid_checkpoint(mailbox=checkpoint.current_mailbox.mailbox, email_id=email_id)
+                continue
+
+            # This UID has now been definitively dealt with (fetched, whether or not
+            # it turns out to be usable below) - safe to advance the resume cursor
+            # past it regardless of what happens next in this iteration.
+            self._advance_uid_checkpoint(mailbox=checkpoint.current_mailbox.mailbox, email_id=email_id)
+
             if not email_msg:
                 logging.warning(f"Failed to fetch message {email_id=}; skipping")
                 continue
@@ -423,8 +646,48 @@ def _select_mailbox(mail_client: imaplib.IMAP4_SSL, mailbox: str) -> bool:
         if status != _IMAP_OKAY_STATUS:
             return False
         return True
+    except _TRANSIENT_IMAP_ERRORS:
+        # Session/connection died mid-SELECT (e.g. a Gmail abort) - let this propagate so
+        # `_call_with_imap_retry` (wrapping `_fetch_email_ids_in_mailbox`) can reconnect and
+        # retry, instead of it being silently swallowed into an "unselectable mailbox" False.
+        raise
     except Exception:
         return False
+
+
+def _fetch_uidvalidity(mail_client: imaplib.IMAP4_SSL, mailbox: str) -> int | None:
+    """
+    Fetches the mailbox's current UIDVALIDITY via `STATUS ... (UIDVALIDITY)`
+    (RFC 3501 §6.3.10) - the value a persisted per-mailbox UID checkpoint must
+    be anchored to. If UIDVALIDITY differs from what was last observed for a
+    mailbox, every previously-remembered UID is meaningless (the server is
+    free to reuse UID numbers after a UIDVALIDITY change) and any saved
+    high-water mark for that mailbox must be discarded.
+
+    Returns `None` if the value could not be determined (caller should treat
+    this as "unknown" rather than assume anything about resumability).
+    """
+    status, data = mail_client.status(mailbox, "(UIDVALIDITY)")
+    if status != _IMAP_OKAY_STATUS or not data or not data[0]:
+        return None
+
+    raw = data[0]
+    text = raw.decode() if isinstance(raw, bytes) else raw
+    match = re.search(r"UIDVALIDITY\s+(\d+)", text)
+    if not match:
+        return None
+
+    return int(match.group(1))
+
+
+def _safe_int(value: str) -> int:
+    """`int(value)`, or -1 if `value` isn't a valid integer - so a malformed
+    UID string can never crash a `> min_uid_exclusive` comparison; -1 simply
+    sorts below any real UID and gets filtered out like any other."""
+    try:
+        return int(value)
+    except ValueError:
+        return -1
 
 
 def _fetch_email_ids_in_mailbox(
@@ -432,6 +695,7 @@ def _fetch_email_ids_in_mailbox(
     mailbox: str,
     start: SecondsSinceUnixEpoch,
     end: SecondsSinceUnixEpoch,
+    min_uid_exclusive: int = 0,
 ) -> list[str]:
     if not _select_mailbox(mail_client, mailbox):
         logging.warning(f"Skip mailbox: {mailbox}")
@@ -444,18 +708,34 @@ def _fetch_email_ids_in_mailbox(
     end_str = end_dt.strftime("%d-%b-%Y")
     search_criteria = f'(SINCE "{start_str}" BEFORE "{end_str}")'
 
-    status, email_ids_byte_array = mail_client.search(None, search_criteria)
+    status, email_ids_byte_array = mail_client.uid("SEARCH", None, search_criteria)
 
     if status != _IMAP_OKAY_STATUS or not email_ids_byte_array:
-        raise RuntimeError(f"Failed to fetch email ids; {status=}")
+        logging.warning(f"Failed to fetch email ids for mailbox {mailbox}; {status=}; skipping")
+        return []
 
     email_ids: bytes = email_ids_byte_array[0]
+    all_ids = [email_id.decode() for email_id in email_ids.split()]
 
-    return [email_id.decode() for email_id in email_ids.split()]
+    if min_uid_exclusive <= 0:
+        return all_ids
+
+    # Durable-resume filtering: skip UIDs already processed in a prior task
+    # invocation (per the persisted `{uidvalidity, last_uid}` checkpoint),
+    # instead of re-fetching a from-beginning pull's entire history on every
+    # resume. Client-side filtering (rather than a server-side UID range in
+    # the SEARCH itself) keeps this simple and robust across IMAP server
+    # implementations; the SEARCH response is cheap (just UID numbers), so
+    # the extra bandwidth here is negligible compared to re-FETCHing bodies.
+    resumed_ids = [email_id for email_id in all_ids if _safe_int(email_id) > min_uid_exclusive]
+    skipped = len(all_ids) - len(resumed_ids)
+    if skipped:
+        logging.info(f"Resuming mailbox {mailbox!r} from UID > {min_uid_exclusive}: skipping {skipped} already-processed UID(s)")
+    return resumed_ids
 
 
 def _fetch_email(mail_client: imaplib.IMAP4_SSL, email_id: str) -> Message | None:
-    status, msg_data = mail_client.fetch(message_set=email_id, message_parts="(RFC822)")
+    status, msg_data = mail_client.uid("FETCH", email_id, "(RFC822)")
     if status != _IMAP_OKAY_STATUS or not msg_data:
         return None
 
@@ -533,7 +813,7 @@ def _convert_email_headers_and_body_into_document(
         semantic_identifier=email_headers.subject,
         metadata={},
         extension=".txt",
-        doc_updated_at=email_headers.date,
+        doc_updated_at=_as_utc(email_headers.date),
         source=DocumentSource.IMAP,
         primary_owners=primary_owners,
         external_access=external_access,
@@ -618,7 +898,7 @@ def attachment_to_document(
         extension=ext,
         blob=att["content_bytes"],
         size_bytes=att["size_bytes"],
-        doc_updated_at=email_headers.date,
+        doc_updated_at=_as_utc(email_headers.date),
         primary_owners=parent_doc.primary_owners,
         metadata={
             "parent_email_id": parent_doc.id,
