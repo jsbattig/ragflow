@@ -856,3 +856,165 @@ async def test_dropbox_generate_skips_snapshot_for_full_reindex(monkeypatch):
     assert [doc.id for doc in file_list] == ["dropbox:id-1", "dropbox:id-2"]
     assert connector.retrieve_all_slim_docs_perm_sync_called is True
     assert connector.poll_source_called is False
+
+
+# ===================================================================== #
+# IMAP._generate - sync window computation regression                  #
+# ===================================================================== #
+#
+# Bug: for a reindex, or the very first run of a connector (no persisted
+# `poll_range_start`), `IMAP._generate` used to set `start_time = now -
+# poll_range` (default 30 days). That silently capped a "from beginning"
+# Gmail sync to the last ~30 days of mail, and because the sync watermark
+# only ever moves forward, that partial coverage became permanent - a
+# 51,820-message mailbox only ever indexed ~506 messages. The fix starts
+# both `start_time` and the prune-snapshot `initial_sync_start` at the Unix
+# epoch (0.0) for that branch, matching every other connector's "from
+# beginning" convention in this module.
+
+
+class _FakeImapConnector:
+    """Records the (start, end) window each `_generate` run feeds into
+    `load_from_checkpoint`, then immediately signals "no more data" so the
+    test doesn't need to fabricate IMAP wire-protocol responses.
+
+    `load_from_checkpoint` mirrors the real `CheckpointOutput` contract used
+    by `common.data_source.imap_connector.ImapConnector._load_from_checkpoint`:
+    a generator that yields zero-or-more `Document`/`ConnectorFailure`
+    instances and then `return`s the next checkpoint (delivered to the caller
+    as the generator's `StopIteration` value). Here there are no documents to
+    yield - the loop body below is over an empty tuple - only the final
+    checkpoint matters for this window-computation test.
+    """
+
+    instance = None
+
+    def __init__(self, host, port, mailboxes):
+        self.host = host
+        self.port = port
+        self.mailboxes = mailboxes
+        self.credentials_provider = None
+        self.load_from_checkpoint_calls = []
+        _FakeImapConnector.instance = self
+
+    def set_credentials_provider(self, credentials_provider):
+        self.credentials_provider = credentials_provider
+
+    def load_uid_checkpoints(self, checkpoints):
+        # Durable UID-checkpoint restore hook the driver now calls before the
+        # fetch loop; this window-computation test carries no saved checkpoints.
+        self.loaded_uid_checkpoints = checkpoints
+
+    @property
+    def uid_checkpoints(self):
+        # Nothing is processed in this stub, so there is no UID progress to persist.
+        return {}
+
+    def build_dummy_checkpoint(self):
+        return types.SimpleNamespace(has_more=True)
+
+    def load_from_checkpoint(self, start, end, checkpoint):
+        self.load_from_checkpoint_calls.append((start, end))
+        return self._checkpoint_generator()
+
+    def _checkpoint_generator(self):
+        for _unused_document in ():
+            yield _unused_document
+        return types.SimpleNamespace(has_more=False)
+
+
+def _imap_conf(**overrides):
+    conf = {
+        "imap_host": "imap.example.com",
+        "imap_port": 993,
+        "imap_mailbox": ["INBOX"],
+        "credentials": {"imap_username": "u", "imap_password": "p"},
+    }
+    conf.update(overrides)
+    return conf
+
+
+def _patch_imap_persist(monkeypatch):
+    # The window-computation branch under test also persists
+    # `imap_initial_sync_start` via ConnectorService.update_by_id, which talks
+    # to the DB. That's wrapped in a try/except in production code (a failure
+    # there only logs), but stubbing it out keeps this a true unit test with
+    # no real service dependency, matching _patch_common_dependencies' role
+    # for the other connectors in this file.
+    monkeypatch.setattr(sync_data_source.ConnectorService, "update_by_id", lambda *_args, **_kwargs: None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.p1
+async def test_imap_generate_first_run_starts_from_epoch_not_thirty_days_ago(monkeypatch):
+    monkeypatch.setattr(sync_data_source, "ImapConnector", _FakeImapConnector)
+    _patch_imap_persist(monkeypatch)
+
+    task = {
+        **_make_task(),
+        "reindex": "0",
+        "poll_range_start": None,
+        "skip_connection_log": True,
+    }
+    sync = sync_data_source.IMAP(_imap_conf())
+
+    document_generator = await sync._generate(task)
+    list(document_generator)  # drive document_batches() so load_from_checkpoint actually runs
+
+    connector = _FakeImapConnector.instance
+    assert connector is not None
+    assert len(connector.load_from_checkpoint_calls) == 1
+    start_time, _end_time = connector.load_from_checkpoint_calls[0]
+    assert start_time == 0.0
+    assert sync._prune_snapshot_kwargs["start"] == 0.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.p1
+async def test_imap_generate_reindex_starts_from_epoch(monkeypatch):
+    monkeypatch.setattr(sync_data_source, "ImapConnector", _FakeImapConnector)
+    _patch_imap_persist(monkeypatch)
+
+    task = {
+        **_make_task(),
+        "reindex": "1",
+        "poll_range_start": datetime(2026, 6, 1, tzinfo=timezone.utc),
+        "skip_connection_log": True,
+    }
+    sync = sync_data_source.IMAP(_imap_conf())
+
+    document_generator = await sync._generate(task)
+    list(document_generator)
+
+    connector = _FakeImapConnector.instance
+    assert connector is not None
+    start_time, _end_time = connector.load_from_checkpoint_calls[0]
+    assert start_time == 0.0
+    # The prune snapshot window must stay aligned with the ingest window,
+    # otherwise sync_deleted_files would treat everything as stale relative
+    # to the old 30-day floor and delete legitimately-indexed history.
+    assert sync._prune_snapshot_kwargs["start"] == 0.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.p2
+async def test_imap_generate_incremental_run_uses_poll_range_start(monkeypatch):
+    monkeypatch.setattr(sync_data_source, "ImapConnector", _FakeImapConnector)
+    _patch_imap_persist(monkeypatch)
+
+    poll_start = datetime(2026, 6, 15, tzinfo=timezone.utc)
+    task = {
+        **_make_task(),
+        "reindex": "0",
+        "poll_range_start": poll_start,
+        "skip_connection_log": True,
+    }
+    sync = sync_data_source.IMAP(_imap_conf(imap_initial_sync_start=0.0))
+
+    document_generator = await sync._generate(task)
+    list(document_generator)
+
+    connector = _FakeImapConnector.instance
+    assert connector is not None
+    start_time, _end_time = connector.load_from_checkpoint_calls[0]
+    assert start_time == poll_start.timestamp()

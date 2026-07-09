@@ -1621,6 +1621,12 @@ class Github(SyncBase):
 class IMAP(SyncBase):
     SOURCE_NAME: str = FileSource.IMAP
 
+    # Throttle for persisting the per-mailbox UID resume checkpoint (see
+    # `document_batches` in `_generate`): write to the DB at most once every
+    # this many processed documents, rather than on every single one, so a
+    # multi-hour/multi-day from-beginning pull doesn't hammer the DB.
+    _UID_CHECKPOINT_PERSIST_INTERVAL = 500
+
     async def _generate(self, task):
         from common.data_source.config import DocumentSource
         from common.data_source.interfaces import StaticCredentialsProvider
@@ -1633,20 +1639,24 @@ class IMAP(SyncBase):
         credentials_provider = StaticCredentialsProvider(tenant_id=task["tenant_id"], connector_name=DocumentSource.IMAP, credential_json=self.conf["credentials"])
         self.connector.set_credentials_provider(credentials_provider)
         end_time = datetime.now(timezone.utc).timestamp()
-        try:
-            poll_range_days = float(self.conf.get("poll_range", 30))
-        except (TypeError, ValueError):
-            poll_range_days = 30
-        default_initial_sync_start = end_time - poll_range_days * 24 * 60 * 60
+        # A "from beginning" / reindex sync must scan the entire mailbox history,
+        # i.e. start at the epoch (0.0) — the same convention every other connector
+        # in this module uses (Confluence, Jira, Google Drive, SharePoint, ...).
+        # Previously this used `now - poll_range` (default 30 days), which silently
+        # capped the initial sync to the last 30 days; the forward-only watermark
+        # then made that partial coverage permanent.
         if task["reindex"] == "1" or not task["poll_range_start"]:
-            start_time = default_initial_sync_start
+            start_time = 0.0
             _begin_info = "totally"
         else:
             start_time = task["poll_range_start"].timestamp()
             _begin_info = f"from {task['poll_range_start']}"
 
         if task["reindex"] == "1":
-            initial_sync_start = default_initial_sync_start
+            # Keep the prune snapshot window aligned with the ingest window, otherwise
+            # `sync_deleted_files` would treat everything older than the (removed) 30-day
+            # floor as stale and delete legitimately-indexed historical documents.
+            initial_sync_start = start_time
             should_persist_initial_start = True
         else:
             initial_sync_start = self.conf.get("imap_initial_sync_start")
@@ -1654,7 +1664,7 @@ class IMAP(SyncBase):
             try:
                 initial_sync_start = float(initial_sync_start)
             except (TypeError, ValueError):
-                initial_sync_start = 0 if task["poll_range_start"] else default_initial_sync_start
+                initial_sync_start = 0.0
                 should_persist_initial_start = True
 
         if should_persist_initial_start:
@@ -1682,11 +1692,36 @@ class IMAP(SyncBase):
         if batch_size <= 0:
             batch_size = INDEX_BATCH_SIZE
 
+        def persist_uid_checkpoints(checkpoints: dict) -> None:
+            # Mirrors the `imap_initial_sync_start` persistence above: same
+            # config-merge-and-save pattern, same best-effort failure handling
+            # (a failed persist just means the next resume falls back to less
+            # precise state - it must never fail the sync itself).
+            updated_conf = copy.deepcopy(self.conf)
+            updated_conf["imap_uid_checkpoints"] = checkpoints
+            try:
+                ConnectorService.update_by_id(task["connector_id"], {"config": updated_conf})
+                self.conf = updated_conf
+            except Exception:
+                logging.exception(
+                    "Failed to persist IMAP UID checkpoints for connector %s",
+                    task["connector_id"],
+                )
+
         def document_batches():
             checkpoint = self.connector.build_dummy_checkpoint()
             pending_docs = []
             iterations = 0
             iteration_limit = 100_000
+
+            # Restore any per-mailbox UID high-water marks saved by a prior task
+            # invocation, so a from-beginning pull interrupted by a task timeout,
+            # container restart, or Gmail's daily bandwidth cap can resume by
+            # skipping already-processed UIDs instead of re-scanning/re-fetching
+            # the whole mailbox from scratch.
+            self.connector.load_uid_checkpoints(self.conf.get("imap_uid_checkpoints"))
+            docs_since_last_uid_persist = 0
+
             while checkpoint.has_more:
                 wrapper = CheckpointOutputWrapper()
                 doc_generator = wrapper(self.connector.load_from_checkpoint(start_time, end_time, checkpoint))
@@ -1696,9 +1731,15 @@ class IMAP(SyncBase):
                         continue
                     if document is not None:
                         pending_docs.append(document)
+                        docs_since_last_uid_persist += 1
                         if len(pending_docs) >= batch_size:
                             yield pending_docs
                             pending_docs = []
+                        # Throttled: persist every N documents rather than on every
+                        # single one, so a multi-hour pull doesn't hammer the DB.
+                        if docs_since_last_uid_persist >= self._UID_CHECKPOINT_PERSIST_INTERVAL:
+                            persist_uid_checkpoints(self.connector.uid_checkpoints)
+                            docs_since_last_uid_persist = 0
                     if next_checkpoint is not None:
                         checkpoint = next_checkpoint
 
@@ -1708,6 +1749,13 @@ class IMAP(SyncBase):
 
             if pending_docs:
                 yield pending_docs
+
+            # Clean completion: every mailbox finished without the task being
+            # killed. Future incremental polls are covered by the coarse
+            # `poll_range_start` watermark, so the fine-grained per-mailbox UID
+            # resume state is no longer needed - clear it rather than leave a
+            # stale cursor around for the next reindex to trip over.
+            persist_uid_checkpoints({})
 
         def wrapper():
             for batch in document_batches():
