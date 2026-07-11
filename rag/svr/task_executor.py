@@ -1869,6 +1869,20 @@ async def report_status():
                         logging.info(f"{worker_name} expired, removed")
                         REDIS_CONN.srem("TASKEXE", worker_name)
                         REDIS_CONN.delete(worker_name)
+                        # worker_name is a task_executor CONSUMER_NAME (see
+                        # main()). Deregistering it above only clears its
+                        # heartbeat bookkeeping - any Redis Stream messages
+                        # still delivered-but-unacked (PEL) under this dead
+                        # consumer are never redelivered by Redis on their
+                        # own (no XCLAIM/XAUTOCLAIM elsewhere in this
+                        # codebase), so without this call they are stuck
+                        # forever and the document(s) they belong to never
+                        # complete.
+                        for svr_queue_name in settings.get_svr_queue_names(TASK_TYPE):
+                            try:
+                                REDIS_CONN.reap_consumer_pending(svr_queue_name, SVR_CONSUMER_GROUP_NAME, worker_name)
+                            except Exception as e:
+                                logging.warning(f"Failed to reap pending entries for expired worker {worker_name} on {svr_queue_name}: {e}")
             except Exception as e:
                 logging.warning(f"Failed to clean other executors: {e}")
             finally:

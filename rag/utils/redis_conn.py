@@ -487,15 +487,64 @@ class RedisDB:
         return []
 
     def requeue_msg(self, queue: str, group_name: str, msg_id: str):
+        """Push a fresh copy of an already-delivered stream entry back onto
+        `queue` and ack the stale `msg_id`.
+
+        The retry loop only retries on a genuine (transient) Redis
+        exception - it must return as soon as it either succeeds or
+        determines there is nothing to do (message already gone from the
+        stream, e.g. trimmed), otherwise xadd/xack fire once per remaining
+        iteration and the message is silently re-added multiple times.
+        """
         for _ in range(3):
             try:
                 messages = self.REDIS.xrange(queue, msg_id, msg_id)
                 if messages:
                     self.REDIS.xadd(queue, messages[0][1])
                     self.REDIS.xack(queue, group_name, msg_id)
+                return
             except Exception as e:
                 logging.warning("RedisDB.get_pending_msg " + str(queue) + " got exception: " + str(e))
                 self.__open__()
+
+    def reap_consumer_pending(self, queue: str, group_name: str, consumer_name: str, batch: int = 1000) -> int:
+        """Reclaim every Redis Stream consumer-group entry currently pending
+        (delivered, never acked) under `consumer_name` in `queue`.
+
+        Callers must have already established that `consumer_name` is dead
+        (e.g. via a heartbeat timeout) before calling this - unlike a
+        blind idle-time sweep, this has no idle-time gate of its own, so
+        calling it against a live consumer would race that consumer's own
+        in-flight work and cause duplicate processing.
+
+        Each reclaimed entry is pushed back onto the stream as a brand-new
+        message (fresh id, same payload) and the stale one is acked, via
+        requeue_msg(), so any live consumer can pick it up like a normal
+        task. `batch` bounds how many entries are scanned/reclaimed in one
+        call (Anti-Unbounded-Loop); callers that expect more than `batch`
+        stale entries for one consumer should call this repeatedly.
+
+        Returns the number of entries reclaimed.
+        """
+        try:
+            pending = self.REDIS.xpending_range(queue, group_name, "-", "+", batch, consumername=consumer_name)
+        except Exception as e:
+            if "no such key" in str(e).lower() or "nogroup" in str(e).lower():
+                return 0
+            logging.warning("RedisDB.reap_consumer_pending " + str(queue) + " got exception: " + str(e))
+            return 0
+
+        reaped = 0
+        for entry in pending:
+            self.requeue_msg(queue, group_name, entry["message_id"])
+            reaped += 1
+        if reaped:
+            plural = "y" if reaped == 1 else "ies"
+            logging.warning(
+                f"RedisDB.reap_consumer_pending reclaimed {reaped} pending entr{plural} "
+                f"from dead consumer {consumer_name} on {queue}/{group_name}"
+            )
+        return reaped
 
     def queue_info(self, queue, group_name) -> dict | None:
         for _ in range(3):
