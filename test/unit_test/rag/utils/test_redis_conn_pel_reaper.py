@@ -38,14 +38,26 @@ to be dead, it reclaims every PEL entry still owned by that consumer,
 re-delivering each as a fresh stream message (via the existing
 requeue_msg() primitive) so a live consumer can pick it up.
 
-These tests run against a real, ephemeral redis-server (Messi Rule #1,
+These tests run against a real Redis-compatible server (Messi Rule #1,
 anti-mock: Redis Streams consumer-group/PEL semantics are exactly the
-behavior under test and cannot be faithfully faked) started out-of-band
-by the test runner on REDIS_CONN_TEST_PORT (defaults to 16399).
+behavior under test and cannot be faithfully faked).
+
+No committed conftest/CI job provisions that server: test/unit_test/ is not
+wired into any CI workflow (CI only runs test/testcases/), so there is no
+established precedent in this repo for provisioning Redis for a unit test.
+To keep this suite self-contained and to degrade gracefully instead of
+hard-failing when nothing is listening, `redis_test_port` below reuses an
+externally-provisioned Redis at REDIS_CONN_TEST_PORT if one is reachable
+(e.g. a future CI service container), otherwise starts and tears down a
+disposable redis-server/valkey-server for the test session, and pytest.skip()s
+- rather than erroring - if neither is available.
 """
 
 import json
 import os
+import shutil
+import socket
+import subprocess
 import time
 
 import pytest
@@ -61,24 +73,85 @@ import common.settings  # noqa: F401,E402 - import order matters, see comment ab
 from rag.utils import redis_conn
 
 
-def _make_test_redis_db() -> "redis_conn.RedisDB":  # noqa: F821 - string forward ref, class name shadowed by singleton wrapper
-    """Build a RedisDB instance wired to the ephemeral test Redis, bypassing
+def _make_test_redis_db(port: int) -> "redis_conn.RedisDB":  # noqa: F821 - string forward ref, class name shadowed by singleton wrapper
+    """Build a RedisDB instance wired to the test Redis on `port`, bypassing
     both the module's @singleton wrapper (which would return the one
     production-config-bound instance) and __init__ (which reads connection
     params from global settings, not our test port).
     """
     real_class = type(redis_conn.REDIS_CONN)
-    port = int(os.environ.get("REDIS_CONN_TEST_PORT", "16399"))
     instance = object.__new__(real_class)
     instance.config = {}
     instance.REDIS = valkey.Redis(host="localhost", port=port, db=0, decode_responses=True)
     return instance
 
 
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _wait_until_reachable(port: int, timeout_s: float = 5.0) -> Exception | None:
+    client = valkey.Redis(host="localhost", port=port, db=0, socket_connect_timeout=1)
+    deadline = time.monotonic() + timeout_s
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            client.ping()
+            return None
+        except Exception as e:  # noqa: BLE001 - probing, any failure means "not ready yet"
+            last_error = e
+            time.sleep(0.05)
+    return last_error
+
+
+@pytest.fixture(scope="session")
+def redis_test_port():
+    """Yield a port with a reachable Redis-compatible server for the whole
+    test session; skip the dependent tests if none can be reached or started.
+
+    `proc` stays None on the "reuse an externally-provisioned Redis" path so
+    teardown never depends on which branch was taken.
+    """
+    proc: subprocess.Popen | None = None
+    try:
+        explicit_port = os.environ.get("REDIS_CONN_TEST_PORT")
+        if explicit_port:
+            port = int(explicit_port)
+            error = _wait_until_reachable(port, timeout_s=1.0)
+            if error is not None:
+                pytest.skip(f"REDIS_CONN_TEST_PORT={port} set but not reachable: {error}")
+            yield port
+            return
+
+        server_bin = shutil.which("redis-server") or shutil.which("valkey-server")
+        if server_bin is None:
+            pytest.skip("REDIS_CONN_TEST_PORT not set and no redis-server/valkey-server binary found on PATH")
+
+        port = _find_free_port()
+        proc = subprocess.Popen(
+            [server_bin, "--port", str(port), "--save", "", "--appendonly", "no"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        error = _wait_until_reachable(port)
+        if error is not None:
+            pytest.skip(f"ephemeral {os.path.basename(server_bin)} on port {port} never became ready: {error}")
+        yield port
+    finally:
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+
+
 @pytest.fixture
-def redis_db():
-    db = _make_test_redis_db()
-    db.REDIS.ping()  # fail fast with a clear error if the test Redis isn't up
+def redis_db(redis_test_port):
+    db = _make_test_redis_db(redis_test_port)
     yield db
 
 
@@ -198,3 +271,99 @@ def test_requeue_msg_does_not_duplicate_the_message(redis_db):
     all_entries = redis_db.REDIS.xrange(queue, "-", "+")
     fresh_entries = [e for e in all_entries if e[0] != msg_id]
     assert len(fresh_entries) == 1
+
+
+def test_requeue_msg_acks_phantom_pel_entry_when_message_was_trimmed(redis_db):
+    """A PEL entry can outlive its stream entry (e.g. trimmed via MAXLEN;
+    here XDEL'd directly to simulate that without configuring MAXLEN), so
+    xrange(msg_id, msg_id) then returns empty. requeue_msg() must still
+    xack msg_id in that case: there is nothing left to re-xadd, but the
+    phantom PEL entry must be cleared - otherwise it is never revisited
+    again (the dead consumer that owned it has already been srem'd from
+    "TASKEXE" tracking by the time reap_consumer_pending() runs) and stays
+    permanently orphaned, defeating the entire point of the reaper for
+    that entry.
+    """
+    queue = _unique_name("te.0.common")
+    group = "rag_flow_svr_task_broker"
+    consumer = "task_executor_common_deadhost_trimmed"
+
+    msg_id = _deliver(redis_db, queue, group, consumer, {"id": "task-trimmed", "doc_id": "doc-trimmed"})
+    redis_db.REDIS.xdel(queue, msg_id)
+
+    redis_db.requeue_msg(queue, group, msg_id)
+
+    remaining_pending = redis_db.REDIS.xpending_range(queue, group, "-", "+", 10, consumername=consumer)
+    assert remaining_pending == []
+
+
+def test_reap_consumer_pending_only_counts_genuine_requeue_successes(redis_db, monkeypatch):
+    """reap_consumer_pending() must only increment `reaped` for entries
+    whose requeue_msg() call actually succeeded.
+
+    Previously it did `self.requeue_msg(...); reaped += 1` unconditionally,
+    so a persistent Redis error on one entry (requeue_msg exhausting its
+    retries and giving up, returning False) was still logged/counted as
+    "reclaimed" even though nothing was actually reclaimed for it.
+    """
+    queue = _unique_name("te.0.common")
+    group = "rag_flow_svr_task_broker"
+    dead_consumer = "task_executor_common_deadhost_partial_fail"
+
+    ok_msg_id = _deliver(redis_db, queue, group, dead_consumer, {"id": "task-ok", "doc_id": "doc-ok"})
+    fail_msg_id = _deliver(redis_db, queue, group, dead_consumer, {"id": "task-fail", "doc_id": "doc-fail"})
+
+    real_requeue_msg = redis_db.requeue_msg
+
+    def flaky_requeue_msg(queue_arg, group_arg, msg_id_arg):
+        if msg_id_arg == fail_msg_id:
+            return False
+        return real_requeue_msg(queue_arg, group_arg, msg_id_arg)
+
+    monkeypatch.setattr(redis_db, "requeue_msg", flaky_requeue_msg)
+
+    reaped = redis_db.reap_consumer_pending(queue, group, dead_consumer)
+
+    assert reaped == 1
+    still_pending = redis_db.REDIS.xpending_range(queue, group, "-", "+", 10, consumername=dead_consumer)
+    still_pending_ids = {p["message_id"] for p in still_pending}
+    assert still_pending_ids == {fail_msg_id}
+    assert ok_msg_id not in still_pending_ids
+
+
+def test_reap_consumer_pending_excludes_entries_below_min_idle_ms(redis_db):
+    """The min_idle_ms gate must exclude entries that have not been pending
+    long enough yet, even though the owning consumer is already known dead.
+
+    A worker can be falsely flagged dead (GC pause, network flap, heartbeat
+    coroutine briefly starved) while genuinely mid-task; if it picked up
+    that task moments ago, yanking the in-flight PEL entry and
+    re-delivering it risks double-processing. Combining the caller's
+    external death signal with this internal idle floor is
+    belt-and-suspenders against that race.
+    """
+    # A gate far above how long the entry has actually been pending (~0ms,
+    # just delivered) - it must be excluded. A gate below the real sleep
+    # below - it must become eligible once genuinely that idle.
+    TOO_LARGE_MIN_IDLE_MS = 60_000
+    SLEEP_BEFORE_RETRY_S = 0.2
+    SMALL_MIN_IDLE_MS = 100
+
+    queue = _unique_name("te.0.common")
+    group = "rag_flow_svr_task_broker"
+    dead_consumer = "task_executor_common_deadhost_idle_gate"
+
+    msg_id = _deliver(redis_db, queue, group, dead_consumer, {"id": "task-recent", "doc_id": "doc-recent"})
+
+    reaped_too_soon = redis_db.reap_consumer_pending(queue, group, dead_consumer, min_idle_ms=TOO_LARGE_MIN_IDLE_MS)
+    assert reaped_too_soon == 0
+    still_pending = redis_db.REDIS.xpending_range(queue, group, "-", "+", 10, consumername=dead_consumer)
+    assert len(still_pending) == 1
+    assert still_pending[0]["message_id"] == msg_id
+
+    # After it has genuinely been idle longer than SMALL_MIN_IDLE_MS, it
+    # becomes eligible - proven against real Redis idle-time reporting via
+    # an actual sleep, not a mock.
+    time.sleep(SLEEP_BEFORE_RETRY_S)
+    reaped_after_idle = redis_db.reap_consumer_pending(queue, group, dead_consumer, min_idle_ms=SMALL_MIN_IDLE_MS)
+    assert reaped_after_idle == 1
