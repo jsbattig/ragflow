@@ -486,36 +486,62 @@ class RedisDB:
                 logging.warning("RedisDB.get_pending_msg " + str(queue) + " got exception: " + str(e))
         return []
 
-    def requeue_msg(self, queue: str, group_name: str, msg_id: str):
+    def requeue_msg(self, queue: str, group_name: str, msg_id: str) -> bool:
         """Push a fresh copy of an already-delivered stream entry back onto
         `queue` and ack the stale `msg_id`.
 
         The retry loop only retries on a genuine (transient) Redis
         exception - it must return as soon as it either succeeds or
-        determines there is nothing to do (message already gone from the
-        stream, e.g. trimmed), otherwise xadd/xack fire once per remaining
-        iteration and the message is silently re-added multiple times.
+        determines there is nothing to re-add (message already gone from
+        the stream, e.g. trimmed), otherwise xadd/xack fire once per
+        remaining iteration and the message is silently re-added multiple
+        times.
+
+        `msg_id` is always xack'd once its fate is determined - including
+        when the message is already gone from the stream. A PEL entry can
+        outlive its stream entry (trimming), and if that phantom entry is
+        left unacked here, it is never revisited: the caller
+        (reap_consumer_pending) is only ever invoked for a consumer already
+        known dead, and that consumer has already been deregistered from
+        tracking by the time this runs - so an un-acked phantom entry would
+        be permanently orphaned.
+
+        Returns True on a confirmed successful requeue (or confirmed
+        already-gone-and-now-acked), False if all retries are exhausted
+        without success - callers must not count a False as a genuine
+        reclaim.
         """
         for _ in range(3):
             try:
                 messages = self.REDIS.xrange(queue, msg_id, msg_id)
                 if messages:
                     self.REDIS.xadd(queue, messages[0][1])
-                    self.REDIS.xack(queue, group_name, msg_id)
-                return
+                self.REDIS.xack(queue, group_name, msg_id)
+                return True
             except Exception as e:
-                logging.warning("RedisDB.get_pending_msg " + str(queue) + " got exception: " + str(e))
+                logging.warning("RedisDB.requeue_msg " + str(queue) + " got exception: " + str(e))
                 self.__open__()
+        return False
 
-    def reap_consumer_pending(self, queue: str, group_name: str, consumer_name: str, batch: int = 1000) -> int:
+    def reap_consumer_pending(self, queue: str, group_name: str, consumer_name: str, batch: int = 1000, min_idle_ms: int = 0) -> int:
         """Reclaim every Redis Stream consumer-group entry currently pending
         (delivered, never acked) under `consumer_name` in `queue`.
 
         Callers must have already established that `consumer_name` is dead
-        (e.g. via a heartbeat timeout) before calling this - unlike a
-        blind idle-time sweep, this has no idle-time gate of its own, so
-        calling it against a live consumer would race that consumer's own
-        in-flight work and cause duplicate processing.
+        (e.g. via a heartbeat timeout) before calling this. That external
+        death signal alone is not proof an individual entry is safe to
+        reclaim though: a worker can be falsely flagged dead (GC pause,
+        network flap, heartbeat coroutine briefly starved) while genuinely
+        mid-task, and an entry it picked up moments ago would then be
+        yanked and re-delivered, risking double-processing. `min_idle_ms`
+        is the internal floor that guards against exactly that: only
+        entries that have ALSO been pending (idle, per Redis's own
+        tracking) for at least `min_idle_ms` are reclaimed - belt-and-
+        suspenders combining the caller's death signal with this idle
+        floor. Defaults to 0 (no floor - immediate reclaim), matching the
+        original behavior for callers that don't pass one; production call
+        sites should pass a floor derived from their own dead-worker
+        detection window (e.g. WORKER_HEARTBEAT_TIMEOUT * 1000).
 
         Each reclaimed entry is pushed back onto the stream as a brand-new
         message (fresh id, same payload) and the stale one is acked, via
@@ -524,10 +550,13 @@ class RedisDB:
         call (Anti-Unbounded-Loop); callers that expect more than `batch`
         stale entries for one consumer should call this repeatedly.
 
-        Returns the number of entries reclaimed.
+        Returns the number of entries genuinely reclaimed - an entry whose
+        requeue_msg() call exhausts its retries and returns False is left
+        in the PEL and is not counted, so this count never overstates what
+        actually happened.
         """
         try:
-            pending = self.REDIS.xpending_range(queue, group_name, "-", "+", batch, consumername=consumer_name)
+            pending = self.REDIS.xpending_range(queue, group_name, "-", "+", batch, consumername=consumer_name, idle=min_idle_ms)
         except Exception as e:
             if "no such key" in str(e).lower() or "nogroup" in str(e).lower():
                 return 0
@@ -536,8 +565,8 @@ class RedisDB:
 
         reaped = 0
         for entry in pending:
-            self.requeue_msg(queue, group_name, entry["message_id"])
-            reaped += 1
+            if self.requeue_msg(queue, group_name, entry["message_id"]):
+                reaped += 1
         if reaped:
             plural = "y" if reaped == 1 else "ies"
             logging.warning(

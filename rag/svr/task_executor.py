@@ -1880,7 +1880,16 @@ async def report_status():
                         # complete.
                         for svr_queue_name in settings.get_svr_queue_names(TASK_TYPE):
                             try:
-                                REDIS_CONN.reap_consumer_pending(svr_queue_name, SVR_CONSUMER_GROUP_NAME, worker_name)
+                                # Belt-and-suspenders: only reclaim entries that
+                                # have ALSO been pending (per Redis's own idle
+                                # tracking) at least as long as the heartbeat
+                                # timeout that got worker_name declared dead in
+                                # the first place - guards against a
+                                # false-positive dead-worker detection (GC
+                                # pause, network flap, heartbeat coroutine
+                                # briefly starved) yanking a genuinely in-flight
+                                # entry it picked up moments ago.
+                                REDIS_CONN.reap_consumer_pending(svr_queue_name, SVR_CONSUMER_GROUP_NAME, worker_name, min_idle_ms=WORKER_HEARTBEAT_TIMEOUT * 1000)
                             except Exception as e:
                                 logging.warning(f"Failed to reap pending entries for expired worker {worker_name} on {svr_queue_name}: {e}")
             except Exception as e:
